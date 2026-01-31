@@ -20,8 +20,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
 
-use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use datafusion::arrow::array::{RecordBatch, StringArray};
+use datafusion::arrow::datatypes::{
+    DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -29,7 +31,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::prelude::Expr;
-use futures::{Stream, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::table::Table;
 
@@ -51,8 +53,6 @@ pub struct IcebergTableScan {
     projection: Option<Vec<String>>,
     /// Filters to apply to the table scan
     predicates: Option<Predicate>,
-    /// Optional limit on the number of rows to return
-    limit: Option<usize>,
 }
 
 impl IcebergTableScan {
@@ -63,7 +63,6 @@ impl IcebergTableScan {
         schema: ArrowSchemaRef,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        limit: Option<usize>,
     ) -> Self {
         let output_schema = match projection {
             None => schema.clone(),
@@ -79,7 +78,6 @@ impl IcebergTableScan {
             plan_properties,
             projection,
             predicates,
-            limit,
         }
     }
 
@@ -97,10 +95,6 @@ impl IcebergTableScan {
 
     pub fn predicates(&self) -> Option<&Predicate> {
         self.predicates.as_ref()
-    }
-
-    pub fn limit(&self) -> Option<usize> {
-        self.limit
     }
 
     /// Computes [`PlanProperties`] used in query optimization.
@@ -154,29 +148,9 @@ impl ExecutionPlan for IcebergTableScan {
         );
         let stream = futures::stream::once(fut).try_flatten();
 
-        // Apply limit if specified
-        let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-            if let Some(limit) = self.limit {
-                let mut remaining = limit;
-                Box::pin(stream.try_filter_map(move |batch| {
-                    futures::future::ready(if remaining == 0 {
-                        Ok(None)
-                    } else if batch.num_rows() <= remaining {
-                        remaining -= batch.num_rows();
-                        Ok(Some(batch))
-                    } else {
-                        let limited_batch = batch.slice(0, remaining);
-                        remaining = 0;
-                        Ok(Some(limited_batch))
-                    })
-                }))
-            } else {
-                Box::pin(stream)
-            };
-
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            limited_stream,
+            stream,
         )))
     }
 }
@@ -195,7 +169,7 @@ impl DisplayAs for IcebergTableScan {
                 .map_or(String::new(), |v| v.join(",")),
             self.predicates
                 .clone()
-                .map_or(String::from(""), |p| format!("{p}"))
+                .map_or(String::from(""), |p| format!("{}", p))
         )
     }
 }
@@ -225,12 +199,23 @@ async fn get_batch_stream(
     }
     let table_scan = scan_builder.build().map_err(to_datafusion_error)?;
 
-    let stream = table_scan
-        .to_arrow()
-        .await
-        .map_err(to_datafusion_error)?
-        .map_err(to_datafusion_error);
-    Ok(Box::pin(stream))
+    let task_stream = table_scan.plan_files().await.map_err(to_datafusion_error)?;
+
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "file_path",
+        DataType::Utf8,
+        false,
+    )]));
+
+    let batch_stream = task_stream.map(move |task_result| {
+        let task = task_result.map_err(to_datafusion_error)?;
+        let file_path = task.data_file_path;
+        let array = StringArray::from(vec![file_path]);
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(array)])
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(e, None))
+    });
+
+    Ok(Box::pin(batch_stream))
 }
 
 fn get_column_names(
