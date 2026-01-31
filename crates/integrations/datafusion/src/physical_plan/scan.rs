@@ -212,7 +212,7 @@ async fn get_batch_stream(
         let file_path = task.data_file_path;
         let array = StringArray::from(vec![file_path]);
         RecordBatch::try_new(schema.clone(), vec![Arc::new(array)])
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(e, None))
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     });
 
     Ok(Box::pin(batch_stream))
