@@ -320,7 +320,8 @@ impl TableProvider for IcebergStaticTableProvider {
             self.snapshot_id,
             self.schema.clone(),
             projection,
-            filters
+            filters,
+            limit,
         )))
     }
 
